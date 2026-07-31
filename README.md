@@ -1,24 +1,22 @@
-# ADC — Potentiomètre → LED PWM
+# I2C — MPU6050 Accéléromètre + Gyroscope
 
-Lecture analogique via ADC1 (GPIO34), convertie en duty cycle PWM pour contrôler la luminosité d'une LED bleue (GPIO18).
-
-Tourne le potentiomètre → intensité de la LED change en temps réel.
-Le terminal affiche uniquement quand la valeur change (seuil de 20 points).
+Lecture d'un capteur MPU6050 via protocole I2C (SDA GPIO21, SCL GPIO22).
+14 bytes lus en une seule transaction (burst read), affichage uniquement si changement détecté.
 
 ## Ce que ça fait
 
-- Lecture ADC moyennée sur 8 échantillons pour réduire le bruit
-- Mapping 0–4095 → 0–255 (duty PWM 8 bits)
-- Mise à jour LED + log uniquement si changement significatif
-- Fréquence PWM : 1kHz
+- Accéléromètre : X / Y / Z en g (±2g, 16384 LSB/g)
+- Gyroscope : X / Y / Z en °/s (±250°/s, 131 LSB/°/s)
+- Température interne en °C (formule datasheet)
+- Log terminal uniquement si un axe dépasse son seuil de changement
 
 ## GPIO
 
 | GPIO | Rôle |
 |---|---|
-| D34 | Lecture potentiomètre (ADC1 canal 6) |
-| D18 | LED bleue PWM |
+| D21 | SDA — données I2C |
+| D22 | SCL — horloge I2C |
 
 ## Concepts
 
-`adc_oneshot_new_unit` · `adc_oneshot_config_channel` · `adc_oneshot_read` · `ADC_ATTEN_DB_12` · `ADC_BITWIDTH_12` · moyennage · mapping ADC → PWM
+`i2c_new_master_bus` · `i2c_master_bus_add_device` · `i2c_master_transmit_receive` · burst read 14 bytes · adresse I2C 0x68 · conversion raw int16 → unités physiques
