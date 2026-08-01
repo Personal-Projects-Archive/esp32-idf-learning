@@ -7,4 +7,6 @@ idf_component_register(
     SRCS ${app_sources}
     REQUIRES
         driver
+        nvs_flash
+        bt
 )

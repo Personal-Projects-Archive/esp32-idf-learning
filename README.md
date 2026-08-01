@@ -1,22 +1,24 @@
-# I2C — MPU6050 Accéléromètre + Gyroscope
+# BLE — Serveur GATT + contrôle LED
 
-Lecture d'un capteur MPU6050 via protocole I2C (SDA GPIO21, SCL GPIO22).
-14 bytes lus en une seule transaction (burst read), affichage uniquement si changement détecté.
+L'ESP32 expose un service BLE via NimBLE.
+Contrôle une LED depuis un smartphone avec l'app nRF Connect.
 
 ## Ce que ça fait
 
-- Accéléromètre : X / Y / Z en g (±2g, 16384 LSB/g)
-- Gyroscope : X / Y / Z en °/s (±250°/s, 131 LSB/°/s)
-- Température interne en °C (formule datasheet)
-- Log terminal uniquement si un axe dépasse son seuil de changement
+- Caractéristique READ → retourne l'état LED ("ON" / "OFF")
+- Caractéristique WRITE → envoie "ON" ou "OFF" pour contrôler la LED D2
+- Relance l'advertising automatiquement après déconnexion
 
-## GPIO
+## Test sur hardware réel
 
-| GPIO | Rôle |
-|---|---|
-| D21 | SDA — données I2C |
-| D22 | SCL — horloge I2C |
+1. Flasher sur un vrai ESP32
+2. Ouvrir **nRF Connect** (iOS / Android) → Scanner
+3. Se connecter à **"ESP32-BLE"**
+4. Trouver la caractéristique WRITE → envoyer `ON` ou `OFF`
+
+> Build validé. Test BLE à faire sur vrai hardware — Wokwi ne simule pas le BLE natif ESP32.
 
 ## Concepts
 
-`i2c_new_master_bus` · `i2c_master_bus_add_device` · `i2c_master_transmit_receive` · burst read 14 bytes · adresse I2C 0x68 · conversion raw int16 → unités physiques
+NimBLE · `nimble_port_init` · `ble_gatt_svc_def` · UUID 128 bits ·
+`ble_gap_adv_start` · GAP events · GATT READ/WRITE callbacks · task FreeRTOS dédiée BLE

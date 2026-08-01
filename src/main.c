@@ -1,145 +1,214 @@
-#include "driver/i2c_master.h"
+#include "nimble/nimble_port.h"
+#include "nimble/nimble_port_freertos.h"
+#include "host/ble_hs.h"
+#include "host/util/util.h"
+#include "services/gap/ble_svc_gap.h"
+#include "services/gatt/ble_svc_gatt.h"
+#include "nvs_flash.h"
 #include "driver/gpio.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "esp_log.h"
-#include <math.h>
+#include <string.h>
 
-static const char *TAG = "MPU6050";
+static const char *TAG         = "BLE";
+static const char *DEVICE_NAME = "ESP32-BLE";
 
-// --- Broches I2C ---
-// I2C = protocole 2 fils : SDA (données) + SCL (horloge)
-#define I2C_SDA         GPIO_NUM_21
-#define I2C_SCL         GPIO_NUM_22
-#define I2C_FREQ_HZ     400000   // 400kHz = mode "fast" I2C
+#define LED_PIN  GPIO_NUM_2
 
-// --- MPU6050 ---
-// Adresse I2C du capteur (broche AD0 à GND = 0x68, AD0 à VCC = 0x69)
-#define MPU_ADDR        0x68
-#define REG_PWR_MGMT_1  0x6B   // registre gestion alimentation — bit0=sleep
-#define REG_ACCEL_START 0x3B   // premier registre de données (14 bytes contigus)
+static bool led_state = false;
 
-// Facteurs de conversion raw → unités physiques (config sortie usine)
-// ±2g    → 16384 LSB par g
-// ±250°/s → 131 LSB par °/s
-#define ACCEL_SCALE     16384.0f
-#define GYRO_SCALE      131.0f
+// Forward declaration nécessaire car gap_event_cb est utilisé dans start_advertising
+static int gap_event_cb(struct ble_gap_event *event, void *arg);
 
-// Seuils minimum pour déclencher un log (évite le spam si capteur stable)
-#define THRESH_ACCEL    0.05f   // en g
-#define THRESH_GYRO     2.0f    // en °/s
-#define THRESH_TEMP     0.5f    // en °C
+// GATT Callback
 
-static i2c_master_dev_handle_t mpu_handle;
-
-// Écrire un byte dans un registre du MPU6050
-// Protocole : [adresse capteur] [registre] [valeur]
-static void mpu_write(uint8_t reg, uint8_t val)
+// Lecture : le client lit l'état actuel de la LED
+static int chr_read_cb(uint16_t conn_handle, uint16_t attr_handle,
+                        struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    uint8_t buf[2] = {reg, val};
-    ESP_ERROR_CHECK(i2c_master_transmit(mpu_handle, buf, 2, 100));
+    const char *val = led_state ? "ON" : "OFF";
+    os_mbuf_append(ctxt->om, val, strlen(val));
+    return 0;
 }
 
-// Lire N bytes consécutifs depuis un registre
-// Protocole : envoie le registre de départ, puis lit N bytes en réponse
-static void mpu_read(uint8_t reg, uint8_t *data, size_t len)
+// Écriture : le client envoie "ON" ou "OFF"
+static int chr_write_cb(uint16_t conn_handle, uint16_t attr_handle,
+                         struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
-    ESP_ERROR_CHECK(i2c_master_transmit_receive(mpu_handle, &reg, 1, data, len, 100));
+    char buf[8] = {0};
+    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
+    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+
+    ble_hs_mbuf_to_flat(ctxt->om, buf, len, NULL);
+    buf[len] = '\0';
+
+    if (strcmp(buf, "ON") == 0)
+    {
+        led_state = true;
+        gpio_set_level(LED_PIN, 1);
+        ESP_LOGI(TAG, "LED ON");
+    }
+    else if (strcmp(buf, "OFF") == 0)
+    {
+        led_state = false;
+        gpio_set_level(LED_PIN, 0);
+        ESP_LOGI(TAG, "LED OFF");
+    }
+    else
+    {
+        ESP_LOGW(TAG, "Commande inconnue: %s", buf);
+    }
+    return 0;
 }
 
-// Assembler 2 bytes en entier signé 16 bits
-// Le MPU envoie les données en big-endian : octet fort d'abord
-static int16_t to_int16(uint8_t hi, uint8_t lo)
+// UUIDs 128 bits custom
+// En production on génère des UUIDs réels (uuidgenerator.net)
+
+static const ble_uuid128_t svc_uuid = BLE_UUID128_INIT(
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10
+);
+
+static const ble_uuid128_t chr_read_uuid = BLE_UUID128_INIT(
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+    0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20
+);
+
+static const ble_uuid128_t chr_write_uuid = BLE_UUID128_INIT(
+    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30
+);
+
+// Table GATT
+// Définit les services et caractéristiques exposés par l'ESP32
+
+static const struct ble_gatt_svc_def gatt_svcs[] = {
+    {
+        .type = BLE_GATT_SVC_TYPE_PRIMARY,
+        .uuid = &svc_uuid.u,
+        .characteristics = (struct ble_gatt_chr_def[]) {
+            {
+                // Lecture état LED
+                .uuid      = &chr_read_uuid.u,
+                .access_cb = chr_read_cb,
+                .flags     = BLE_GATT_CHR_F_READ,
+            },
+            {
+                // Écriture commande "ON" / "OFF"
+                .uuid      = &chr_write_uuid.u,
+                .access_cb = chr_write_cb,
+                .flags     = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
+            },
+            { 0 } // terminateur obligatoire
+        }
+    },
+    { 0 } // terminateur obligatoire
+};
+
+// Advertising
+
+static void start_advertising(void)
 {
-    return (int16_t)((hi << 8) | lo);
+    // Payload advertisement : nom du device + flags
+    struct ble_hs_adv_fields fields = {0};
+    fields.flags            = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
+    fields.name             = (uint8_t *)DEVICE_NAME;
+    fields.name_len         = strlen(DEVICE_NAME);
+    fields.name_is_complete = 1;
+    ble_gap_adv_set_fields(&fields);
+
+    // Paramètres : connectable + discoverable
+    struct ble_gap_adv_params adv_params = {0};
+    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;  // undirected connectable
+    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;  // general discoverable
+
+    ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
+                      &adv_params, gap_event_cb, NULL);
+
+    ESP_LOGI(TAG, "Advertising — cherche '%s' dans nRF Connect", DEVICE_NAME);
 }
 
-// Vérifie si la différence entre deux floats dépasse un seuil
-static bool changed_f(float a, float b, float thresh)
+// GAP Events
+
+static int gap_event_cb(struct ble_gap_event *event, void *arg)
 {
-    return fabsf(a - b) > thresh;
+    switch (event->type)
+    {
+        case BLE_GAP_EVENT_CONNECT:
+            if (event->connect.status == 0)
+                ESP_LOGI(TAG, "Client connecte — handle %d",
+                         event->connect.conn_handle);
+            else
+                start_advertising(); // echec → relance
+            break;
+
+        case BLE_GAP_EVENT_DISCONNECT:
+            ESP_LOGI(TAG, "Client deconnecte (raison: %d) — relance advertising",
+                     event->disconnect.reason);
+            start_advertising();
+            break;
+
+        default:
+            break;
+    }
+    return 0;
 }
+
+// NimBLE init
+
+// Appelé quand le stack BLE est synchronisé et prêt
+static void ble_on_sync(void)
+{
+    ble_hs_util_ensure_addr(0);
+    start_advertising();
+}
+
+// Task FreeRTOS dédiée au stack NimBLE
+static void ble_host_task(void *param)
+{
+    nimble_port_run();              // bloquant — tourne indéfiniment
+    nimble_port_freertos_deinit();
+}
+
+// app_main
 
 void app_main(void)
 {
-    // --- Initialisation du bus I2C ---
-    // Un bus peut avoir plusieurs devices (MPU6050, OLED, etc.)
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port                     = I2C_NUM_0,       // port I2C 0
-        .sda_io_num                   = I2C_SDA,
-        .scl_io_num                   = I2C_SCL,
-        .clk_source                   = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt            = 7,               // filtre bruit sur le bus
-        .flags.enable_internal_pullup = true,            // résistances pull-up internes
-    };
-    i2c_master_bus_handle_t bus_handle;
-    ESP_ERROR_CHECK(i2c_new_master_bus(&bus_cfg, &bus_handle));
-
-    // --- Ajout du MPU6050 sur le bus ---
-    // Chaque device a sa propre adresse 7 bits
-    i2c_device_config_t dev_cfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address  = MPU_ADDR,       // 0x68
-        .scl_speed_hz    = I2C_FREQ_HZ,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_cfg, &mpu_handle));
-
-    // Sortie du mode sleep — par défaut le MPU6050 démarre en veille
-    // Écrire 0x00 dans PWR_MGMT_1 = réveil complet
-    mpu_write(REG_PWR_MGMT_1, 0x00);
-    vTaskDelay(pdMS_TO_TICKS(100));   // attente stabilisation
-
-    ESP_LOGI(TAG, "=== MPU6050 pret ===");
-
-    // Initialisés hors plage pour forcer l'affichage au premier cycle
-    float last_ax = 999, last_ay = 999, last_az = 999;
-    float last_gx = 999, last_gy = 999, last_gz = 999;
-    float last_temp = 999;
-
-    while (1)
+    // NVS requis par NimBLE pour stocker les clés de pairing
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
-        uint8_t buf[14];
-
-        // Lecture burst : 14 bytes depuis 0x3B en une seule transaction I2C
-        // Structure des 14 bytes :
-        // [0-1]  Accel X  [2-3]  Accel Y  [4-5]  Accel Z
-        // [6-7]  Temp
-        // [8-9]  Gyro X   [10-11] Gyro Y  [12-13] Gyro Z
-        mpu_read(REG_ACCEL_START, buf, 14);
-
-        // Conversion raw int16 → unités physiques
-        float ax   = to_int16(buf[0],  buf[1])  / ACCEL_SCALE;   // g
-        float ay   = to_int16(buf[2],  buf[3])  / ACCEL_SCALE;   // g
-        float az   = to_int16(buf[4],  buf[5])  / ACCEL_SCALE;   // g
-        float temp = to_int16(buf[6],  buf[7])  / 340.0f + 36.53f; // °C (formule datasheet)
-        float gx   = to_int16(buf[8],  buf[9])  / GYRO_SCALE;    // °/s
-        float gy   = to_int16(buf[10], buf[11]) / GYRO_SCALE;    // °/s
-        float gz   = to_int16(buf[12], buf[13]) / GYRO_SCALE;    // °/s
-
-        // Log uniquement si au moins un axe a changé au-delà du seuil
-        bool accel_changed = changed_f(ax, last_ax, THRESH_ACCEL)
-                          || changed_f(ay, last_ay, THRESH_ACCEL)
-                          || changed_f(az, last_az, THRESH_ACCEL);
-
-        bool gyro_changed  = changed_f(gx, last_gx, THRESH_GYRO)
-                          || changed_f(gy, last_gy, THRESH_GYRO)
-                          || changed_f(gz, last_gz, THRESH_GYRO);
-
-        bool temp_changed  = changed_f(temp, last_temp, THRESH_TEMP);
-
-        if (accel_changed || gyro_changed || temp_changed)
-        {
-            ESP_LOGI(TAG, "Accel  X:%6.2f  Y:%6.2f  Z:%6.2f  g",     ax, ay, az);
-            ESP_LOGI(TAG, "Gyro   X:%6.2f  Y:%6.2f  Z:%6.2f  deg/s", gx, gy, gz);
-            ESP_LOGI(TAG, "Temp   %.1f C", temp);
-            ESP_LOGI(TAG, "---");
-
-            // Mise à jour des valeurs précédentes
-            last_ax = ax; last_ay = ay; last_az = az;
-            last_gx = gx; last_gy = gy; last_gz = gz;
-            last_temp = temp;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(100));   // lecture toutes les 100ms
+        nvs_flash_erase();
+        nvs_flash_init();
     }
+
+    // LED
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << LED_PIN),
+        .mode         = GPIO_MODE_OUTPUT,
+        .pull_up_en   = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE
+    };
+    gpio_config(&cfg);
+    gpio_set_level(LED_PIN, 0);
+
+    // Init NimBLE
+    nimble_port_init();
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+    ble_svc_gap_device_name_set(DEVICE_NAME);
+
+    // Enregistrement des services GATT
+    ble_gatts_count_cfg(gatt_svcs);
+    ble_gatts_add_svcs(gatt_svcs);
+
+    // Callback déclenché quand le stack est prêt
+    ble_hs_cfg.sync_cb = ble_on_sync;
+
+    // Démarre la task BLE sur FreeRTOS
+    nimble_port_freertos_init(ble_host_task);
+
+    ESP_LOGI(TAG, "=== BLE pret ===");
+    ESP_LOGI(TAG, "Ouvre nRF Connect → scan → connecte a '%s'", DEVICE_NAME);
+    ESP_LOGI(TAG, "Caracteristique WRITE → envoie 'ON' ou 'OFF'");
 }
