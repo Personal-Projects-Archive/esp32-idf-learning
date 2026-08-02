@@ -1,24 +1,28 @@
-# BLE — Serveur GATT + contrôle LED
+# MQTT — Publish / Subscribe avec broker HiveMQ
 
-L'ESP32 expose un service BLE via NimBLE.
-Contrôle une LED depuis un smartphone avec l'app nRF Connect.
+L'ESP32 se connecte au broker public HiveMQ et échange des messages MQTT en temps réel.
+Contrôle une LED depuis MQTT Explorer et reçoit une température simulée toutes les 5 secondes.
 
-## Ce que ça fait
+![Demo](docs/demo-mqtt.png)
 
-- Caractéristique READ → retourne l'état LED ("ON" / "OFF")
-- Caractéristique WRITE → envoie "ON" ou "OFF" pour contrôler la LED D2
-- Relance l'advertising automatiquement après déconnexion
+## Topics
 
-## Test sur hardware réel
+| Topic | Direction | Contenu |
+|---|---|---|
+| `esp32-idf-learning/led` | Subscribe | `ON` ou `OFF` |
+| `esp32-idf-learning/status` | Publish | `{"led":"ON"}` |
+| `esp32-idf-learning/temperature` | Publish | Température simulée toutes les 5s |
 
-1. Flasher sur un vrai ESP32
-2. Ouvrir **nRF Connect** (iOS / Android) → Scanner
-3. Se connecter à **"ESP32-BLE"**
-4. Trouver la caractéristique WRITE → envoyer `ON` ou `OFF`
+## Test
 
-> Build validé. Test BLE à faire sur vrai hardware — Wokwi ne simule pas le BLE natif ESP32.
+1. Ouvrir **MQTT Explorer** → connecter à `broker.hivemq.com:1883`
+2. Lancer la simulation Wokwi
+3. Publier `ON` ou `OFF` sur `esp32-idf-learning/led`
+4. Observer la LED et les topics en temps réel
+
+> MQTT requis via IDF Component Manager (`src/idf_component.yml`) — téléchargé automatiquement au premier build dans `managed_components/`.
 
 ## Concepts
 
-NimBLE · `nimble_port_init` · `ble_gatt_svc_def` · UUID 128 bits ·
-`ble_gap_adv_start` · GAP events · GATT READ/WRITE callbacks · task FreeRTOS dédiée BLE
+`esp_mqtt_client_init` · `esp_mqtt_client_subscribe` · `esp_mqtt_client_publish` ·
+`MQTT_EVENT_DATA` · publish/subscribe · broker public · QoS · `idf_component.yml`

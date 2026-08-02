@@ -1,179 +1,194 @@
-#include "nimble/nimble_port.h"
-#include "nimble/nimble_port_freertos.h"
-#include "host/ble_hs.h"
-#include "host/util/util.h"
-#include "services/gap/ble_svc_gap.h"
-#include "services/gatt/ble_svc_gatt.h"
+#include <string.h>
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
 #include "driver/gpio.h"
-#include "esp_log.h"
-#include <string.h>
+#include "mqtt_client.h"
 
-static const char *TAG         = "BLE";
-static const char *DEVICE_NAME = "ESP32-BLE";
+// WiFi Wokwi
+#define WIFI_SSID           "Wokwi-GUEST"
+#define WIFI_PASS           ""
+#define WIFI_CONNECTED_BIT  BIT0
+
+// Broker public gratuit — pas besoin de compte
+#define BROKER_URI   "mqtt://broker.hivemq.com:1883"
+
+// Topics — préfixe unique pour éviter les conflits avec d'autres utilisateurs
+#define TOPIC_LED    "esp32-idf-learning/led"          // subscribe → reçoit ON/OFF
+#define TOPIC_STATUS "esp32-idf-learning/status"       // publish  → état LED
+#define TOPIC_TEMP   "esp32-idf-learning/temperature"  // publish  → température simulée
 
 #define LED_PIN  GPIO_NUM_2
 
+static const char *TAG = "MQTT";
+static EventGroupHandle_t       wifi_event_group;
+static esp_mqtt_client_handle_t mqtt_client;
 static bool led_state = false;
 
-// Forward declaration nécessaire car gap_event_cb est utilisé dans start_advertising
-static int gap_event_cb(struct ble_gap_event *event, void *arg);
+// ─── LED ─────────────────────────────────────────────────────────────────────
 
-// GATT Callback
-
-// Lecture : le client lit l'état actuel de la LED
-static int chr_read_cb(uint16_t conn_handle, uint16_t attr_handle,
-                        struct ble_gatt_access_ctxt *ctxt, void *arg)
+static void set_led(bool state)
 {
-    const char *val = led_state ? "ON" : "OFF";
-    os_mbuf_append(ctxt->om, val, strlen(val));
-    return 0;
+    led_state = state;
+    gpio_set_level(LED_PIN, state ? 1 : 0);
+    ESP_LOGI(TAG, "LED %s", state ? "ON" : "OFF");
 }
 
-// Écriture : le client envoie "ON" ou "OFF"
-static int chr_write_cb(uint16_t conn_handle, uint16_t attr_handle,
-                         struct ble_gatt_access_ctxt *ctxt, void *arg)
+// ─── Publish ─────────────────────────────────────────────────────────────────
+
+static void publish_status(void)
 {
-    char buf[8] = {0};
-    uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
-    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
-
-    ble_hs_mbuf_to_flat(ctxt->om, buf, len, NULL);
-    buf[len] = '\0';
-
-    if (strcmp(buf, "ON") == 0)
-    {
-        led_state = true;
-        gpio_set_level(LED_PIN, 1);
-        ESP_LOGI(TAG, "LED ON");
-    }
-    else if (strcmp(buf, "OFF") == 0)
-    {
-        led_state = false;
-        gpio_set_level(LED_PIN, 0);
-        ESP_LOGI(TAG, "LED OFF");
-    }
-    else
-    {
-        ESP_LOGW(TAG, "Commande inconnue: %s", buf);
-    }
-    return 0;
+    char msg[32];
+    snprintf(msg, sizeof(msg), "{\"led\":\"%s\"}", led_state ? "ON" : "OFF");
+    esp_mqtt_client_publish(mqtt_client, TOPIC_STATUS, msg, 0, 1, 0);
+    ESP_LOGI(TAG, "Pub %s -> %s", TOPIC_STATUS, msg);
 }
 
-// UUIDs 128 bits custom
-// En production on génère des UUIDs réels (uuidgenerator.net)
-
-static const ble_uuid128_t svc_uuid = BLE_UUID128_INIT(
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-    0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10
-);
-
-static const ble_uuid128_t chr_read_uuid = BLE_UUID128_INIT(
-    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
-    0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20
-);
-
-static const ble_uuid128_t chr_write_uuid = BLE_UUID128_INIT(
-    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
-    0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30
-);
-
-// Table GATT
-// Définit les services et caractéristiques exposés par l'ESP32
-
-static const struct ble_gatt_svc_def gatt_svcs[] = {
-    {
-        .type = BLE_GATT_SVC_TYPE_PRIMARY,
-        .uuid = &svc_uuid.u,
-        .characteristics = (struct ble_gatt_chr_def[]) {
-            {
-                // Lecture état LED
-                .uuid      = &chr_read_uuid.u,
-                .access_cb = chr_read_cb,
-                .flags     = BLE_GATT_CHR_F_READ,
-            },
-            {
-                // Écriture commande "ON" / "OFF"
-                .uuid      = &chr_write_uuid.u,
-                .access_cb = chr_write_cb,
-                .flags     = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_NO_RSP,
-            },
-            { 0 } // terminateur obligatoire
-        }
-    },
-    { 0 } // terminateur obligatoire
-};
-
-// Advertising
-
-static void start_advertising(void)
+// Tâche FreeRTOS — publie une température simulée toutes les 5 secondes
+static void publish_task(void *arg)
 {
-    // Payload advertisement : nom du device + flags
-    struct ble_hs_adv_fields fields = {0};
-    fields.flags            = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.name             = (uint8_t *)DEVICE_NAME;
-    fields.name_len         = strlen(DEVICE_NAME);
-    fields.name_is_complete = 1;
-    ble_gap_adv_set_fields(&fields);
+    int tick = 0;
+    while (1)
+    {
+        vTaskDelay(pdMS_TO_TICKS(5000));
 
-    // Paramètres : connectable + discoverable
-    struct ble_gap_adv_params adv_params = {0};
-    adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;  // undirected connectable
-    adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;  // general discoverable
+        // Température simulée entre 20.0 et 24.5°C
+        float temp = 20.0f + (float)(tick % 10) * 0.5f;
+        char msg[16];
+        snprintf(msg, sizeof(msg), "%.1f", temp);
 
-    ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER,
-                      &adv_params, gap_event_cb, NULL);
-
-    ESP_LOGI(TAG, "Advertising — cherche '%s' dans nRF Connect", DEVICE_NAME);
+        esp_mqtt_client_publish(mqtt_client, TOPIC_TEMP, msg, 0, 0, 0);
+        ESP_LOGI(TAG, "Pub %s -> %s°C", TOPIC_TEMP, msg);
+        tick++;
+    }
 }
 
-// GAP Events
+// ─── MQTT Events ─────────────────────────────────────────────────────────────
 
-static int gap_event_cb(struct ble_gap_event *event, void *arg)
+static void mqtt_event_handler(void *arg, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
 {
-    switch (event->type)
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+
+    switch (event_id)
     {
-        case BLE_GAP_EVENT_CONNECT:
-            if (event->connect.status == 0)
-                ESP_LOGI(TAG, "Client connecte — handle %d",
-                         event->connect.conn_handle);
-            else
-                start_advertising(); // echec → relance
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "Connecte au broker");
+            // S'abonne au topic LED dès la connexion
+            esp_mqtt_client_subscribe(mqtt_client, TOPIC_LED, 1);
+            ESP_LOGI(TAG, "Subscribe: %s", TOPIC_LED);
+            publish_status();
             break;
 
-        case BLE_GAP_EVENT_DISCONNECT:
-            ESP_LOGI(TAG, "Client deconnecte (raison: %d) — relance advertising",
-                     event->disconnect.reason);
-            start_advertising();
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG, "Deconnecte — reconnexion automatique...");
+            break;
+
+        case MQTT_EVENT_DATA:
+        {
+            // Extraction topic et payload (pas null-terminés par défaut)
+            char topic[64] = {0};
+            char data[64]  = {0};
+            int tlen = event->topic_len < 63 ? event->topic_len : 63;
+            int dlen = event->data_len  < 63 ? event->data_len  : 63;
+            memcpy(topic, event->topic, tlen);
+            memcpy(data,  event->data,  dlen);
+
+            ESP_LOGI(TAG, "Recu | %s -> %s", topic, data);
+
+            // Commande LED
+            if (strcmp(topic, TOPIC_LED) == 0)
+            {
+                if      (strcmp(data, "ON")  == 0) set_led(true);
+                else if (strcmp(data, "OFF") == 0) set_led(false);
+                else ESP_LOGW(TAG, "Commande inconnue: %s", data);
+                publish_status();
+            }
+        }
+        break;
+
+        case MQTT_EVENT_ERROR:
+            ESP_LOGE(TAG, "Erreur MQTT");
             break;
 
         default:
             break;
     }
-    return 0;
 }
 
-// NimBLE init
-
-// Appelé quand le stack BLE est synchronisé et prêt
-static void ble_on_sync(void)
+static void start_mqtt(void)
 {
-    ble_hs_util_ensure_addr(0);
-    start_advertising();
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = BROKER_URI,
+    };
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID,
+                                   mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
 }
 
-// Task FreeRTOS dédiée au stack NimBLE
-static void ble_host_task(void *param)
+// ─── WiFi ─────────────────────────────────────────────────────────────────────
+
+static void wifi_event_handler(void *arg, esp_event_base_t base,
+                               int32_t event_id, void *event_data)
 {
-    nimble_port_run();              // bloquant — tourne indéfiniment
-    nimble_port_freertos_deinit();
+    if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
+    {
+        esp_wifi_connect();
+    }
+    else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
+    {
+        ESP_LOGW(TAG, "WiFi perdu — reconnexion...");
+        esp_wifi_connect();
+    }
+    else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
+    {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)event_data;
+        char ip[16];
+        esp_ip4addr_ntoa(&e->ip_info.ip, ip, sizeof(ip));
+        ESP_LOGI(TAG, "IP: %s", ip);
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+    }
 }
 
-// app_main
+static void wifi_init(void)
+{
+    wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                               wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                               wifi_event_handler, NULL));
+
+    wifi_config_t wifi_cfg = {};
+    strlcpy((char *)wifi_cfg.sta.ssid,     WIFI_SSID, sizeof(wifi_cfg.sta.ssid));
+    strlcpy((char *)wifi_cfg.sta.password, WIFI_PASS, sizeof(wifi_cfg.sta.password));
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
+                        false, true, portMAX_DELAY);
+}
+
+// ─── app_main ─────────────────────────────────────────────────────────────────
 
 void app_main(void)
 {
-    // NVS requis par NimBLE pour stocker les clés de pairing
+    // NVS
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
     {
@@ -192,23 +207,18 @@ void app_main(void)
     gpio_config(&cfg);
     gpio_set_level(LED_PIN, 0);
 
-    // Init NimBLE
-    nimble_port_init();
-    ble_svc_gap_init();
-    ble_svc_gatt_init();
-    ble_svc_gap_device_name_set(DEVICE_NAME);
+    // WiFi → attend connexion avant de continuer
+    wifi_init();
 
-    // Enregistrement des services GATT
-    ble_gatts_count_cfg(gatt_svcs);
-    ble_gatts_add_svcs(gatt_svcs);
+    // MQTT
+    start_mqtt();
 
-    // Callback déclenché quand le stack est prêt
-    ble_hs_cfg.sync_cb = ble_on_sync;
+    // Tâche publication température
+    xTaskCreate(publish_task, "mqtt_pub", 4096, NULL, 5, NULL);
 
-    // Démarre la task BLE sur FreeRTOS
-    nimble_port_freertos_init(ble_host_task);
-
-    ESP_LOGI(TAG, "=== BLE pret ===");
-    ESP_LOGI(TAG, "Ouvre nRF Connect → scan → connecte a '%s'", DEVICE_NAME);
-    ESP_LOGI(TAG, "Caracteristique WRITE → envoie 'ON' ou 'OFF'");
+    ESP_LOGI(TAG, "=== MQTT pret ===");
+    ESP_LOGI(TAG, "Broker : %s", BROKER_URI);
+    ESP_LOGI(TAG, "Sub    : %s", TOPIC_LED);
+    ESP_LOGI(TAG, "Pub    : %s", TOPIC_STATUS);
+    ESP_LOGI(TAG, "Pub    : %s", TOPIC_TEMP);
 }
