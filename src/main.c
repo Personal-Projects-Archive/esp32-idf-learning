@@ -1,224 +1,281 @@
-#include <string.h>
-#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/event_groups.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_log.h"
-#include "esp_netif.h"
-#include "nvs_flash.h"
+#include "esp_adc/adc_oneshot.h"
+#include "driver/ledc.h"
 #include "driver/gpio.h"
-#include "mqtt_client.h"
+#include "esp_log.h"
 
-// WiFi Wokwi
-#define WIFI_SSID           "Wokwi-GUEST"
-#define WIFI_PASS           ""
-#define WIFI_CONNECTED_BIT  BIT0
+static const char *TAG = "FREERTOS";
 
-// Broker public gratuit — pas besoin de compte
-#define BROKER_URI   "mqtt://broker.hivemq.com:1883"
+// GPIO
+#define POT_CHANNEL    ADC_CHANNEL_6  // GPIO34 potentiometre
+#define LED_PWM_PIN    GPIO_NUM_18    // LED bleue controlée par PWM
+#define LED_STATUS_PIN GPIO_NUM_2     // LED verte — clignote = systeme vivant
+#define BTN_PIN        GPIO_NUM_4     // bouton toggle
 
-// Topics — préfixe unique pour éviter les conflits avec d'autres utilisateurs
-#define TOPIC_LED    "esp32-idf-learning/led"          // subscribe → reçoit ON/OFF
-#define TOPIC_STATUS "esp32-idf-learning/status"       // publish  → état LED
-#define TOPIC_TEMP   "esp32-idf-learning/temperature"  // publish  → température simulée
+// LEDC
+#define LEDC_MODE  LEDC_LOW_SPEED_MODE
+#define LEDC_TIMER LEDC_TIMER_0
+#define LEDC_CHAN  LEDC_CHANNEL_0
+#define LEDC_RES   LEDC_TIMER_8_BIT
+#define PWM_FREQ   1000
 
-#define LED_PIN  GPIO_NUM_2
+// Event bit
+#define EVT_BTN_PRESSED  BIT0
 
-static const char *TAG = "MQTT";
-static EventGroupHandle_t       wifi_event_group;
-static esp_mqtt_client_handle_t mqtt_client;
-static bool led_state = false;
+// Primitives FreeRTOS
+static QueueHandle_t      queue_adc;    // Canal ADC → LED
+static SemaphoreHandle_t  mutex_stats;  // Protège les compteurs partagés
+static EventGroupHandle_t event_group;  // Signaux bouton → LED
 
-// ─── LED ─────────────────────────────────────────────────────────────────────
+// Variables partagées (protégées par mutex_stats)
+static uint32_t adc_read_count = 0;  // Nb lectures ADC
+static uint32_t led_upd_count  = 0;  // Nb mises à jour PWM
+static bool     led_enabled    = true;
 
-static void set_led(bool state)
+// LEDC
+
+static void ledc_init(void)
 {
-    led_state = state;
-    gpio_set_level(LED_PIN, state ? 1 : 0);
-    ESP_LOGI(TAG, "LED %s", state ? "ON" : "OFF");
+    ledc_timer_config_t timer = {
+        .speed_mode      = LEDC_MODE,
+        .timer_num       = LEDC_TIMER,
+        .duty_resolution = LEDC_RES,
+        .freq_hz         = PWM_FREQ,
+        .clk_cfg         = LEDC_AUTO_CLK
+    };
+    ledc_timer_config(&timer);
+
+    ledc_channel_config_t ch = {
+        .gpio_num   = LED_PWM_PIN,
+        .speed_mode = LEDC_MODE,
+        .channel    = LEDC_CHAN,
+        .timer_sel  = LEDC_TIMER,
+        .duty       = 0,
+        .hpoint     = 0,
+        .intr_type  = LEDC_INTR_DISABLE
+    };
+    ledc_channel_config(&ch);
 }
 
-// ─── Publish ─────────────────────────────────────────────────────────────────
-
-static void publish_status(void)
+static void set_duty(int duty)
 {
-    char msg[32];
-    snprintf(msg, sizeof(msg), "{\"led\":\"%s\"}", led_state ? "ON" : "OFF");
-    esp_mqtt_client_publish(mqtt_client, TOPIC_STATUS, msg, 0, 1, 0);
-    ESP_LOGI(TAG, "Pub %s -> %s", TOPIC_STATUS, msg);
+    ledc_set_duty(LEDC_MODE, LEDC_CHAN, duty);
+    ledc_update_duty(LEDC_MODE, LEDC_CHAN);
 }
 
-// Tâche FreeRTOS — publie une température simulée toutes les 5 secondes
-static void publish_task(void *arg)
+// TASK 1 : ADC (Priorité 3 — HAUTE)
+// Lit le potentiomètre toutes les 50ms
+// Envoie le duty dans la queue si changement > 10 points
+// Incrémente adc_read_count (protégé par mutex)
+
+static void task_adc(void *arg)
 {
-    int tick = 0;
+    adc_oneshot_unit_handle_t adc;
+
+    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT_1 };
+    adc_oneshot_new_unit(&unit_cfg, &adc);
+
+    adc_oneshot_chan_cfg_t ch_cfg = {
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12
+    };
+    adc_oneshot_config_channel(adc, POT_CHANNEL, &ch_cfg);
+
+    int last = -1;
+
+    while (1)
+    {
+        int raw = 0;
+        adc_oneshot_read(adc, POT_CHANNEL, &raw);
+        int duty = (raw * 255) / 4095;
+
+        if (abs(raw - last) > 10)
+        {
+            // Envoie dans la queue — non-bloquant (timeout 0)
+            // Si la queue est pleine, on abandonne ce cycle
+            xQueueSend(queue_adc, &duty, 0);
+            last = raw;
+
+            // Mutex : protège adc_read_count partagé avec task_monitor
+            xSemaphoreTake(mutex_stats, portMAX_DELAY);
+            adc_read_count++;
+            xSemaphoreGive(mutex_stats);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+// TASK 2 : BOUTON (Priorité 3 — HAUTE)
+// Détecte le front descendant
+// Signale via EventGroup → task_led réagit
+
+static void task_button(void *arg)
+{
+    int last = 1;
+
+    while (1)
+    {
+        int state = gpio_get_level(BTN_PIN);
+
+        // Front descendant → set bit dans l'event group
+        // task_led attendra ce bit pour toggle la LED
+        if (last == 1 && state == 0)
+        {
+            xEventGroupSetBits(event_group, EVT_BTN_PRESSED);
+            ESP_LOGI(TAG, "[button] Bouton presse");
+        }
+
+        last = state;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+// TASK 3 : LED (Priorité 2 — MOYENNE)
+// Reçoit le duty depuis la queue ADC
+// Vérifie l'event group pour le toggle bouton
+// Met à jour le PWM si LED activée
+
+static void task_led(void *arg)
+{
+    while (1)
+    {
+        // Vérifie l'event group — non-bloquant (timeout 0)
+        // pdTRUE = efface le bit après lecture
+        EventBits_t bits = xEventGroupWaitBits(
+            event_group,
+            EVT_BTN_PRESSED,
+            pdTRUE,   // clear after read
+            pdFALSE,  // n'attend pas TOUS les bits
+            0         // timeout 0 = non-bloquant
+        );
+
+        if (bits & EVT_BTN_PRESSED)
+        {
+            // Toggle led_enabled (protégé par mutex)
+            xSemaphoreTake(mutex_stats, portMAX_DELAY);
+            led_enabled = !led_enabled;
+            bool state  = led_enabled;
+            xSemaphoreGive(mutex_stats);
+
+            ESP_LOGI(TAG, "[led] LED %s", state ? "activee" : "desactivee");
+            if (!state) set_duty(0);
+        }
+
+        // Attend une valeur ADC — bloque 100ms max
+        int duty = 0;
+        if (xQueueReceive(queue_adc, &duty, pdMS_TO_TICKS(100)) == pdTRUE)
+        {
+            bool enabled;
+            xSemaphoreTake(mutex_stats, portMAX_DELAY);
+            enabled = led_enabled;
+            xSemaphoreGive(mutex_stats);
+
+            if (enabled)
+            {
+                set_duty(duty);
+
+                // Mutex : protège led_upd_count partagé avec task_monitor
+                xSemaphoreTake(mutex_stats, portMAX_DELAY);
+                led_upd_count++;
+                xSemaphoreGive(mutex_stats);
+
+                ESP_LOGI(TAG, "[led] duty: %d/255 | %d%%",
+                    duty, (duty * 100) / 255);
+            }
+        }
+    }
+}
+
+// TASK 4 : MONITOR (Priorité 1 — BASSE) 
+// Affiche des stats système toutes les 5 secondes
+// Montre le nombre de tâches actives + compteurs partagés
+
+static void task_monitor(void *arg)
+{
     while (1)
     {
         vTaskDelay(pdMS_TO_TICKS(5000));
 
-        // Température simulée entre 20.0 et 24.5°C
-        float temp = 20.0f + (float)(tick % 10) * 0.5f;
-        char msg[16];
-        snprintf(msg, sizeof(msg), "%.1f", temp);
+        // Lit les compteurs partagés via mutex
+        xSemaphoreTake(mutex_stats, portMAX_DELAY);
+        uint32_t adc_cnt = adc_read_count;
+        uint32_t led_cnt = led_upd_count;
+        bool     enabled = led_enabled;
+        xSemaphoreGive(mutex_stats);
 
-        esp_mqtt_client_publish(mqtt_client, TOPIC_TEMP, msg, 0, 0, 0);
-        ESP_LOGI(TAG, "Pub %s -> %s°C", TOPIC_TEMP, msg);
-        tick++;
+        UBaseType_t nb_tasks = uxTaskGetNumberOfTasks();
+        UBaseType_t stack    = uxTaskGetStackHighWaterMark(NULL);
+
+        ESP_LOGI(TAG, "=== MONITOR ===");
+        ESP_LOGI(TAG, "  Tasks actives  : %u", (unsigned)nb_tasks);
+        ESP_LOGI(TAG, "  Stack libre    : %u words", (unsigned)stack);
+        ESP_LOGI(TAG, "  Lectures ADC   : %lu", adc_cnt);
+        ESP_LOGI(TAG, "  Updates PWM    : %lu", led_cnt);
+        ESP_LOGI(TAG, "  LED            : %s", enabled ? "ON" : "OFF");
     }
 }
 
-// ─── MQTT Events ─────────────────────────────────────────────────────────────
+// TASK 5 : BLINK (Priorité 1 — BASSE)
+// Fait clignoter la LED verte toutes les 500ms
+// Preuve visuelle que le scheduler FreeRTOS tourne
 
-static void mqtt_event_handler(void *arg, esp_event_base_t base,
-                               int32_t event_id, void *event_data)
+static void task_blink(void *arg)
 {
-    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
-
-    switch (event_id)
+    bool state = false;
+    while (1)
     {
-        case MQTT_EVENT_CONNECTED:
-            ESP_LOGI(TAG, "Connecte au broker");
-            // S'abonne au topic LED dès la connexion
-            esp_mqtt_client_subscribe(mqtt_client, TOPIC_LED, 1);
-            ESP_LOGI(TAG, "Subscribe: %s", TOPIC_LED);
-            publish_status();
-            break;
-
-        case MQTT_EVENT_DISCONNECTED:
-            ESP_LOGW(TAG, "Deconnecte — reconnexion automatique...");
-            break;
-
-        case MQTT_EVENT_DATA:
-        {
-            // Extraction topic et payload (pas null-terminés par défaut)
-            char topic[64] = {0};
-            char data[64]  = {0};
-            int tlen = event->topic_len < 63 ? event->topic_len : 63;
-            int dlen = event->data_len  < 63 ? event->data_len  : 63;
-            memcpy(topic, event->topic, tlen);
-            memcpy(data,  event->data,  dlen);
-
-            ESP_LOGI(TAG, "Recu | %s -> %s", topic, data);
-
-            // Commande LED
-            if (strcmp(topic, TOPIC_LED) == 0)
-            {
-                if      (strcmp(data, "ON")  == 0) set_led(true);
-                else if (strcmp(data, "OFF") == 0) set_led(false);
-                else ESP_LOGW(TAG, "Commande inconnue: %s", data);
-                publish_status();
-            }
-        }
-        break;
-
-        case MQTT_EVENT_ERROR:
-            ESP_LOGE(TAG, "Erreur MQTT");
-            break;
-
-        default:
-            break;
+        state = !state;
+        gpio_set_level(LED_STATUS_PIN, state);
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
-static void start_mqtt(void)
-{
-    esp_mqtt_client_config_t mqtt_cfg = {
-        .broker.address.uri = BROKER_URI,
-    };
-    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
-    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID,
-                                   mqtt_event_handler, NULL);
-    esp_mqtt_client_start(mqtt_client);
-}
-
-// ─── WiFi ─────────────────────────────────────────────────────────────────────
-
-static void wifi_event_handler(void *arg, esp_event_base_t base,
-                               int32_t event_id, void *event_data)
-{
-    if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
-    {
-        esp_wifi_connect();
-    }
-    else if (base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED)
-    {
-        ESP_LOGW(TAG, "WiFi perdu — reconnexion...");
-        esp_wifi_connect();
-    }
-    else if (base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP)
-    {
-        ip_event_got_ip_t *e = (ip_event_got_ip_t *)event_data;
-        char ip[16];
-        esp_ip4addr_ntoa(&e->ip_info.ip, ip, sizeof(ip));
-        ESP_LOGI(TAG, "IP: %s", ip);
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
-    }
-}
-
-static void wifi_init(void)
-{
-    wifi_event_group = xEventGroupCreate();
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t init_cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&init_cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                               wifi_event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                               wifi_event_handler, NULL));
-
-    wifi_config_t wifi_cfg = {};
-    strlcpy((char *)wifi_cfg.sta.ssid,     WIFI_SSID, sizeof(wifi_cfg.sta.ssid));
-    strlcpy((char *)wifi_cfg.sta.password, WIFI_PASS, sizeof(wifi_cfg.sta.password));
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
-                        false, true, portMAX_DELAY);
-}
-
-// ─── app_main ─────────────────────────────────────────────────────────────────
+// app_main
 
 void app_main(void)
 {
-    // NVS
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
-
-    // LED
-    gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << LED_PIN),
+    // GPIO
+    gpio_config_t out_cfg = {
+        .pin_bit_mask = (1ULL << LED_STATUS_PIN),
         .mode         = GPIO_MODE_OUTPUT,
         .pull_up_en   = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type    = GPIO_INTR_DISABLE
     };
-    gpio_config(&cfg);
-    gpio_set_level(LED_PIN, 0);
+    gpio_config(&out_cfg);
 
-    // WiFi → attend connexion avant de continuer
-    wifi_init();
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = (1ULL << BTN_PIN),
+        .mode         = GPIO_MODE_INPUT,
+        .pull_up_en   = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type    = GPIO_INTR_DISABLE
+    };
+    gpio_config(&btn_cfg);
 
-    // MQTT
-    start_mqtt();
+    ledc_init();
 
-    // Tâche publication température
-    xTaskCreate(publish_task, "mqtt_pub", 4096, NULL, 5, NULL);
+    // Création des primitives FreeRTOS
+    queue_adc   = xQueueCreate(10, sizeof(int));   // file de 10 entiers
+    mutex_stats = xSemaphoreCreateMutex();          // protège les compteurs
+    event_group = xEventGroupCreate();              // signal bouton → LED
 
-    ESP_LOGI(TAG, "=== MQTT pret ===");
-    ESP_LOGI(TAG, "Broker : %s", BROKER_URI);
-    ESP_LOGI(TAG, "Sub    : %s", TOPIC_LED);
-    ESP_LOGI(TAG, "Pub    : %s", TOPIC_STATUS);
-    ESP_LOGI(TAG, "Pub    : %s", TOPIC_TEMP);
+    // Création des tâches
+    // xTaskCreate(fonction, nom, stack(words), arg, priorité, handle)
+    // Priorité : plus le chiffre est élevé, plus la tâche est prioritaire
+    xTaskCreate(task_adc,     "adc",     2048, NULL, 3, NULL);
+    xTaskCreate(task_button,  "button",  1024, NULL, 3, NULL);
+    xTaskCreate(task_led,     "led",     2048, NULL, 2, NULL);
+    xTaskCreate(task_monitor, "monitor", 2048, NULL, 1, NULL);
+    xTaskCreate(task_blink,   "blink",   1024, NULL, 1, NULL);
+
+    ESP_LOGI(TAG, "=== FreeRTOS avance — 5 taches actives ===");
+    ESP_LOGI(TAG, "Pot GPIO34 → PWM LED bleue GPIO18");
+    ESP_LOGI(TAG, "BTN GPIO4  → toggle LED | LED verte GPIO2 = systeme vivant");
+    ESP_LOGI(TAG, "Stats toutes les 5 secondes dans le terminal");
 }
