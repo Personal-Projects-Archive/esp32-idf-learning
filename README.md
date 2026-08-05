@@ -1,48 +1,43 @@
-# FreeRTOS Avancé — 5 tâches en parallèle
+# Registres Directs — GPIO sans API
 
-Démonstration des primitives FreeRTOS sur ESP32 :
-5 tâches tournent en parallèle et communiquent entre elles via Queue, Mutex et Event Group.
+Piloter les GPIO en écrivant directement dans la mémoire de l'ESP32,
+sans passer par les fonctions ESP-IDF comme `gpio_set_level()`.
 
-## Ce que ça fait concrètement
+## Ce que ça fait
 
-Tourne le potentiomètre → la LED bleue change d'intensité en temps réel.
-Appuie sur le bouton → la LED bleue s'éteint / se rallume (toggle).
-La LED verte clignote en permanence → preuve que le scheduler tourne.
-Toutes les 5 secondes → le terminal affiche les stats système.
+- Affiche les valeurs des registres GPIO au démarrage
+- Compare la vitesse ESP-IDF vs accès direct sur 100 000 opérations
+- Bouton toggle LED entièrement via registres directs
+- Affiche le registre `GPIO_OUT_REG` après chaque toggle — on voit le bit changer en direct
 
-## Les 5 tâches
+## Ce qu'on voit dans le terminal
 
-| Tâche | Priorité | Rôle |
-|---|---|---|
-| `task_adc` | 3 (haute) | Lit le potentiomètre toutes les 50ms, envoie le duty dans la Queue |
-| `task_button` | 3 (haute) | Détecte l'appui bouton, envoie un signal via Event Group |
-| `task_led` | 2 (moyenne) | Reçoit le duty (Queue) et le signal bouton (Event Group), met à jour le PWM |
-| `task_monitor` | 1 (basse) | Affiche les stats toutes les 5s (nb tâches, stack libre, compteurs) |
-| `task_blink` | 1 (basse) | Fait clignoter la LED verte toutes les 500ms |
+```
+GPIO_OUT_REG    @ 0x3FF44004 = 0x00000000
+GPIO_ENABLE_REG @ 0x3FF44020 = 0x00000004
 
-## Pourquoi 3 primitives différentes ?
+ESP-IDF gpio_set_level : ~300000 us
+Registre direct        :  ~48000 us
 
-**Queue** → transporter des données d'une tâche à l'autre (valeur ADC → duty PWM).
-Fonctionne comme un tuyau : task_adc pousse, task_led reçoit.
+BTN GPIO4 → toggle LED GPIO2 via registre direct
+LED ON  | GPIO_OUT_REG = 0x00000004 | bit2 = 1
+LED OFF | GPIO_OUT_REG = 0x00000000 | bit2 = 0
+```
 
-**Mutex** → protéger une variable partagée par plusieurs tâches.
-Sans mutex, deux tâches pourraient lire/écrire en même temps → corruption de données.
+## Pourquoi c'est plus rapide
 
-**Event Group** → envoyer un signal sans données (juste "ça s'est passé").
-Le bouton lève un bit, task_led le détecte et toggle la LED.
+`gpio_set_level()` fait des vérifications internes avant d'agir.
+L'accès direct = une seule écriture en mémoire, rien d'autre.
+C'est ce qui est utilisé dans les drivers temps-réel.
 
 ## GPIO
 
 | GPIO | Rôle |
 |---|---|
-| D34 | Potentiomètre (ADC1 canal 6) |
-| D18 | LED bleue PWM (intensité = vitesse) |
-| D2 | LED verte status (clignote = système vivant) |
-| D4 | Bouton toggle LED bleue |
+| D2 | LED rouge |
+| D4 | Bouton |
 
 ## Concepts
 
-`xTaskCreate` · priorités tâches · `xQueueCreate` · `xQueueSend` · `xQueueReceive` ·
-`xSemaphoreCreateMutex` · `xSemaphoreTake` · `xSemaphoreGive` ·
-`xEventGroupCreate` · `xEventGroupSetBits` · `xEventGroupWaitBits` ·
-`uxTaskGetNumberOfTasks` · `uxTaskGetStackHighWaterMark`
+`soc/gpio_reg.h` · `GPIO_OUT_W1TS_REG` · `GPIO_OUT_W1TC_REG` ·
+`REG_READ` · `REG_WRITE` · mémoire mappée
