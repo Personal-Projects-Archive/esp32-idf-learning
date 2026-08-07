@@ -1,43 +1,66 @@
-# Registres Directs — GPIO sans API
+# ESP32 — Apprentissage ESP-IDF
 
-Piloter les GPIO en écrivant directement dans la mémoire de l'ESP32,
-sans passer par les fonctions ESP-IDF comme `gpio_set_level()`.
+Parcours d'apprentissage complet de l'ESP32 avec le framework **ESP-IDF**.  
+Chaque commit dans l'historique correspond à un projet ou exercice indépendant.
 
-## Ce que ça fait
+Environnement : **VSCode + PlatformIO + Wokwi Simulator**
 
-- Affiche les valeurs des registres GPIO au démarrage
-- Compare la vitesse ESP-IDF vs accès direct sur 100 000 opérations
-- Bouton toggle LED entièrement via registres directs
-- Affiche le registre `GPIO_OUT_REG` après chaque toggle — on voit le bit changer en direct
+---
 
-## Ce qu'on voit dans le terminal
+## Projets
 
-```
-GPIO_OUT_REG    @ 0x3FF44004 = 0x00000000
-GPIO_ENABLE_REG @ 0x3FF44020 = 0x00000004
+| # | Dossier | Concept principal |
+|---|---|---|
+| 01 | `01-pwm-motor-control` | Système moteur — boutons + LEDs d'état + PWM |
+| 02 | `02-web-server` | Serveur HTTP embarqué — WiFi, REST API, HTML en C |
+| 03 | `03-adc-potentiometer` | ADC — lecture analogique, mapping vers PWM |
+| 04 | `04-i2c-mpu6050` | I2C — accéléromètre + gyroscope MPU6050 |
+| 05 | `05-ble-nimble` | BLE — serveur GATT, advertising, NimBLE |
+| 06 | `06-mqtt` | MQTT — publish/subscribe, broker HiveMQ |
+| 07 | `07-freertos-advanced` | FreeRTOS — tasks, queue, mutex, event group |
+| 08 | `08-direct-registers` | Registres directs — GPIO sans API, accès mémoire |
+| 09 | `09-iot-complete` | **Projet final** — MPU6050 + MQTT + Web Server + FreeRTOS |
 
-ESP-IDF gpio_set_level : ~300000 us
-Registre direct        :  ~48000 us
+---
 
-BTN GPIO4 → toggle LED GPIO2 via registre direct
-LED ON  | GPIO_OUT_REG = 0x00000004 | bit2 = 1
-LED OFF | GPIO_OUT_REG = 0x00000000 | bit2 = 0
-```
+## Stack technique
 
-## Pourquoi c'est plus rapide
-
-`gpio_set_level()` fait des vérifications internes avant d'agir.
-L'accès direct = une seule écriture en mémoire, rien d'autre.
-C'est ce qui est utilisé dans les drivers temps-réel.
-
-## GPIO
-
-| GPIO | Rôle |
+| Couche | Technologie |
 |---|---|
-| D2 | LED rouge |
-| D4 | Bouton |
+| Firmware | ESP-IDF 6.x |
+| Build | PlatformIO + CMake |
+| Simulation | Wokwi for VSCode |
+| Périphériques | GPIO · PWM (LEDC) · ADC · I2C · UART |
+| Connectivité | WiFi · BLE (NimBLE) · MQTT · HTTP Server |
+| RTOS | FreeRTOS — tasks, queues, mutex, event groups |
+| Bas niveau | Registres directs via `soc/gpio_reg.h` |
 
-## Concepts
+---
 
-`soc/gpio_reg.h` · `GPIO_OUT_W1TS_REG` · `GPIO_OUT_W1TC_REG` ·
-`REG_READ` · `REG_WRITE` · mémoire mappée
+## Progression des concepts
+
+```
+GPIO → PWM → ADC → I2C
+              │
+              ▼
+         FreeRTOS (tasks, queues, mutex)
+              │
+              ▼
+    WiFi → HTTP Server → MQTT → BLE
+              │
+              ▼
+         Registres directs
+              │
+              ▼
+        Projet IoT complet
+```
+
+---
+
+## Environnement
+
+- **OS :** Windows
+- **IDE :** VSCode + extension PlatformIO
+- **Simulateur :** Wokwi for VSCode
+- **Framework :** ESP-IDF via PlatformIO (`framework = espidf`)
+- **Board :** ESP32 DevKit C V4

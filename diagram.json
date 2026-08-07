@@ -10,36 +10,33 @@
       "left": 0,
       "attrs": { "builder": "esp-idf" }
     },
-    {
-      "type": "wokwi-pushbutton",
-      "id": "btn1",
-      "top": 150,
-      "left": 230,
-      "attrs": { "color": "green", "bounce": "0" }
-    },
+    { "type": "wokwi-mpu6050", "id": "mpu1", "top": 157.42, "left": 261.52, "attrs": {} },
     {
       "type": "wokwi-resistor",
       "id": "r1",
-      "top": 90.35,
-      "left": 153.6,
+      "top": -25.4,
+      "left": 219.95,
+      "rotate": 270,
       "attrs": { "value": "220" }
     },
     {
       "type": "wokwi-led",
       "id": "led1",
-      "top": -70.8,
-      "left": 195.8,
-      "attrs": { "color": "red" }
+      "top": -99.6,
+      "left": 224.6,
+      "attrs": { "color": "green" }
     }
   ],
   "connections": [
     [ "esp:TX", "$serialMonitor:RX", "", [] ],
     [ "esp:RX", "$serialMonitor:TX", "", [] ],
-    [ "btn1:1.l", "esp:4", "green", [ "h-38", "v-19" ] ],
-    [ "btn1:2.l", "esp:GND.1", "black", [ "h-38", "v58", "h-211.2", "v-86.4" ] ],
-    [ "esp:2", "r1:1", "red", [ "h43.24", "v-67.2" ] ],
-    [ "r1:2", "led1:A", "red", [ "h8.4", "v-68.4", "h-19.2" ] ],
-    [ "led1:C", "esp:GND.1", "black", [ "v19.2", "h-230", "v163.2" ] ]
+    [ "esp:21", "mpu1:SDA", "blue", [] ],
+    [ "esp:22", "mpu1:SCL", "yellow", [] ],
+    [ "esp:3V3", "mpu1:VCC", "red", [ "h-23.81", "v-38.4", "h355.12" ] ],
+    [ "esp:GND.1", "mpu1:GND", "black", [ "h-33.41", "v76.8", "h384", "v-96", "h-28.88" ] ],
+    [ "esp:2", "r1:1", "green", [ "h148.84", "v-153.6" ] ],
+    [ "r1:2", "led1:A", "green", [] ],
+    [ "led1:C", "esp:GND.1", "black", [ "h-268.4", "v211.2" ] ]
   ],
   "dependencies": {}
 }
