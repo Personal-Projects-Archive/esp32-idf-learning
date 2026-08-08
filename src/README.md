@@ -1,60 +1,37 @@
-# Projet IoT Complet : MPU6050 + MQTT + Web Server + FreeRTOS
+# OTA — Mise à jour firmware sans fil
 
-Système IoT qui combine tous les concepts appris :
-le MPU6050 est lu en continu, les données partent sur MQTT et sont visibles
-sur un dashboard web hébergé directement sur l'ESP32.
-
-## Démonstration
-
-| Système arrêté | Système en marche |
-|---|---|
-| ![Offline](../docs/iot-offline.png) | ![Online](../docs/iot-online.png) |
-
-## Architecture
-
-```
-MPU6050 (I2C)
-     │
-task_sensor ──► Queue ──► task_mqtt_pub ──► broker.hivemq.com
-     │                                            ↑
-     ▼                                      MQTT Explorer
-  g_data (mutex)
-     │
-HTTP Server ──► Dashboard navigateur
-     │
-task_status ──► LED verte clignote (système en vie)
-```
+Mise à jour du firmware ESP32 via WiFi depuis un navigateur,
+sans brancher de câble USB. Intégré au projet IoT complet.
 
 ## Ce que ça fait
 
-- Lit le MPU6050 toutes les 500ms (accéléro X/Y/Z, gyro X/Y/Z, température)
-- Publie les données sur MQTT toutes les 500ms
-- Sert un dashboard web avec mise à jour automatique toutes les secondes
-- LED verte clignote en permanence — preuve que le système tourne
-- `esp32-iot/status` → `online` au démarrage, `offline` si déconnecté
+- Page `/ota` accessible depuis le dashboard web
+- Sélectionne le fichier `firmware.bin` généré par PlatformIO
+- L'ESP32 reçoit, vérifie et écrit le nouveau firmware dans la partition inactive
+- Redémarre automatiquement sur le nouveau firmware
+- Si le firmware est invalide → rollback automatique sur l'ancien
 
-## Topics MQTT
+## Comment l'utiliser (vrai hardware)
 
-| Topic | Contenu |
-|---|---|
-| `esp32-iot/sensors` | JSON accéléro + gyro + température |
-| `esp32-iot/status` | `online` / `offline` |
+```
+1. Flasher l'ESP32 une première fois via USB
+2. Récupérer l'IP dans le terminal série
+3. Ouvrir http://<IP>/ota dans le navigateur
+4. PlatformIO → Build
+5. Sélectionner .pio/build/esp32dev/firmware.bin
+6. Cliquer "Mettre à jour"
+7. L'ESP32 redémarre avec le nouveau firmware
+```
 
-## Test MQTT Explorer
+> Test sur vrai hardware uniquement — la flash physique ne peut pas être simulée dans Wokwi.
 
-Connecter à `broker.hivemq.com:1883` →
-les topics `esp32-iot/sensors` et `esp32-iot/status` apparaissent automatiquement.
-Bouger les sliders du MPU6050 dans Wokwi → les valeurs changent en direct.
+## Partition table
 
-## GPIO
-
-| GPIO | Rôle |
-|---|---|
-| D21 | SDA — I2C MPU6050 |
-| D22 | SCL — I2C MPU6050 |
-| D2 | LED verte status |
+Fichier `partitions.csv` ajouté à la racine du projet.
+Deux partitions OTA (`ota_0` / `ota_1`) de 1.25MB chacune.
+L'ESP32 alterne entre les deux à chaque mise à jour.
 
 ## Concepts
 
-`i2c_master_bus` · `esp_http_server` · `esp_mqtt_client` · `xTaskCreate` ·
-`xQueueSend/Receive` · `xSemaphoreTake/Give` · Last Will MQTT · dashboard HTML embarqué
+`esp_ota_ops.h` · `esp_ota_begin` · `esp_ota_write` · `esp_ota_end` ·
+`esp_ota_set_boot_partition` · `esp_restart` · partition table OTA · rollback automatique

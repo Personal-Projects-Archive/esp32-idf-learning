@@ -20,6 +20,7 @@ Environnement : **VSCode + PlatformIO + Wokwi Simulator**
 | 07 | `07-freertos-advanced` | FreeRTOS — tasks, queue, mutex, event group |
 | 08 | `08-direct-registers` | Registres directs — GPIO sans API, accès mémoire |
 | 09 | `09-iot-complete` | **Projet final** — MPU6050 + MQTT + Web Server + FreeRTOS |
+| 10 | `10-ota` | OTA — mise à jour firmware via WiFi, partition table, rollback |
 
 ---
 

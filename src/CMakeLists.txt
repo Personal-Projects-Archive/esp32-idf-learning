@@ -13,4 +13,5 @@ idf_component_register(
         esp_event
         esp_http_server
         mqtt
+        app_update
 )
